@@ -1,0 +1,19 @@
+# Web scraping
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==5.1.0
+
+# HTML parsing
+html5lib==1.1
+
+# Environment variables
+python-dotenv==1.0.1
+
+# Google Cloud Functions
+functions-framework==3.5.0
+
+# Data handling
+python-dateutil==2.8.2
+
+# Google Cloud Storage
+google-cloud-storage==2.14.0
