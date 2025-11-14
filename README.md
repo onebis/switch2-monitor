@@ -304,7 +304,64 @@ gcloud services enable cloudscheduler.googleapis.com
 gcloud services enable cloudbuild.googleapis.com
 ```
 
-### 3. Cloud Functions へのデプロイ
+### 3. Cloud Storage バケットの作成（必須）
+
+Cloud Functions では、関数の再起動時にファイルシステムの `/tmp` 以外がリセットされるため、状態ファイルを永続化するために **Cloud Storage** が必要です。
+
+#### ステップ1: バケットの作成
+
+```bash
+# プロジェクトIDを確認
+gcloud config get-value project
+
+# バケットを作成（バケット名は全世界で一意である必要があります）
+# 例: switch2-monitor-state-YOUR_PROJECT_ID
+gsutil mb -p YOUR_PROJECT_ID -l asia-northeast1 gs://switch2-monitor-state-YOUR_PROJECT_ID
+```
+
+> **バケット名の注意点**
+> * バケット名は Google Cloud 全体で一意である必要があります
+> * プロジェクトIDやランダムな文字列を含めることを推奨（例: `switch2-monitor-state-myproject123`）
+> * 小文字、数字、ハイフン（-）のみ使用可能
+
+#### ステップ2: サービスアカウントの確認
+
+Cloud Functions が使用するサービスアカウントを確認します。
+
+```bash
+# デフォルトのサービスアカウント（App Engine default service account）
+# 形式: YOUR_PROJECT_ID@appspot.gserviceaccount.com
+gcloud iam service-accounts list
+```
+
+通常、Cloud Functions は以下のサービスアカウントを使用します：
+```
+YOUR_PROJECT_ID@appspot.gserviceaccount.com
+```
+
+#### ステップ3: ストレージ権限の付与
+
+サービスアカウントに Cloud Storage への書き込み権限を付与します。
+
+```bash
+# サービスアカウントに Storage Object Admin 権限を付与
+# YOUR_PROJECT_ID と switch2-monitor-state-YOUR_PROJECT_ID を実際の値に置き換えてください
+gsutil iam ch serviceAccount:YOUR_PROJECT_ID@appspot.gserviceaccount.com:objectAdmin gs://switch2-monitor-state-YOUR_PROJECT_ID
+```
+
+#### ステップ4: 設定値の確認
+
+デプロイ時に必要な環境変数を整理します：
+
+| 環境変数名 | 説明 | 取得方法 |
+|-----------|------|---------|
+| `USE_CLOUD_STORAGE` | Cloud Storage の使用を有効化 | 固定値: `True` |
+| `GCS_BUCKET_NAME` | 作成したバケット名 | 上記で作成したバケット名（例: `switch2-monitor-state-YOUR_PROJECT_ID`） |
+| `GCS_STATE_FILE` | 状態ファイル名（省略可） | 省略時は `switch2_lottery_state.json` が使用されます |
+
+---
+
+### 4. Cloud Functions へのデプロイ
 
 ```bash
 cd switch2
@@ -321,8 +378,16 @@ gcloud functions deploy switch2_monitor \
   --set-env-vars \
     LINE_CHANNEL_ACCESS_TOKEN=your_channel_access_token,\
     LINE_USER_ID=your_user_id,\
-    LINE_GROUP_ID=your_group_id
+    LINE_GROUP_ID=your_group_id,\
+    USE_CLOUD_STORAGE=True,\
+    GCS_BUCKET_NAME=switch2-monitor-state-YOUR_PROJECT_ID
 ```
+
+> **重要な環境変数の説明**
+> * `LINE_CHANNEL_ACCESS_TOKEN`: LINE Messaging API のチャネルアクセストークン
+> * `LINE_USER_ID` または `LINE_GROUP_ID`: 通知先（どちらか一方を設定）
+> * `USE_CLOUD_STORAGE=True`: Cloud Storage を使用（Cloud Functions では **必須**）
+> * `GCS_BUCKET_NAME`: 作成した Cloud Storage バケット名
 
 デプロイ後、関数の URL が表示されます：
 
@@ -330,7 +395,7 @@ gcloud functions deploy switch2_monitor \
 https://asia-northeast1-YOUR_PROJECT_ID.cloudfunctions.net/switch2_monitor
 ```
 
-### 4. デプロイ後の動作確認
+### 5. デプロイ後の動作確認
 
 ```bash
 # テスト通知（疎通確認）
@@ -340,7 +405,7 @@ curl "https://asia-northeast1-YOUR_PROJECT_ID.cloudfunctions.net/switch2_monitor
 curl "https://asia-northeast1-YOUR_PROJECT_ID.cloudfunctions.net/switch2_monitor"
 ```
 
-### 5. Cloud Scheduler で定期実行
+### 6. Cloud Scheduler で定期実行
 
 ```bash
 # App Engine アプリ作成（Cloud Scheduler 利用に必要）
