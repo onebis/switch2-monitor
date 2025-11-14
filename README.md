@@ -1,294 +1,314 @@
 # Switch2 多言語版抽選販売監視システム
 
-Nintendo Switch2の多言語版抽選販売を監視し、新しい抽選情報があればLINE Messaging APIで通知するシステムです。
+Nintendo Switch2 の **多言語版 抽選 / 招待販売** を監視し、
+新しい情報が見つかったときに **LINE Messaging API** で通知するシステムです。
 
-## クイックスタート
+---
 
-### ローカルで試す（5分で完了）
+## 機能
+
+* 任天堂公式ストア（[https://store-jp.nintendo.com/）を定期的に監視](https://store-jp.nintendo.com/）を定期的に監視)
+* キーワードベースの検出（例: `Switch2`, `多言語`, `抽選`, `招待販売` など）
+* コンテンツハッシュによる変更検出（前回との差分のみ通知）
+* 初回実行時は通知をスキップしてベースラインを作成
+* エラーハンドリング・リトライ・詳細ログ出力
+* Google Cloud Functions + Cloud Scheduler による自動実行
+
+---
+
+## ファイル構成
+
+```text
+switch2/
+├── main.py              # Cloud Functions エントリーポイント
+├── scraper.py           # スクレイピングロジック（任天堂ストア用）
+├── notifier.py          # LINE Messaging API 通知ロジック
+├── state_manager.py     # 状態管理（変更検出・永続化）
+├── config.py            # 設定ファイル（キーワード等）
+├── test_local.py        # ローカル統合テスト
+├── requirements.txt     # Python 依存関係
+├── .env.example         # 環境変数サンプル
+├── .gitignore           # Git 除外設定
+├── .gcloudignore        # Cloud Functions デプロイ除外設定
+├── README.md            # このファイル
+├── DEPLOYMENT.md        # デプロイ詳細手順書
+└── CLAUDE.md            # 開発者向けガイド（Claude Code 用）
+```
+
+---
+
+## クイックスタート（ローカルで試す）
+
+> ※ まずローカルで一度動作確認し、その後 Cloud Functions へデプロイするのがおすすめです。
 
 ```bash
 # 1. リポジトリをクローン
 git clone <your-repo-url>
 cd switch2
 
-# 2. 環境設定
+# 2. .env を作成
 cp .env.example .env
-# .envファイルを編集してLINE_CHANNEL_ACCESS_TOKEN, LINE_USER_ID/LINE_GROUP_IDを設定
+# エディタで .env を開き、LINE_CHANNEL_ACCESS_TOKEN と
+# LINE_USER_ID または LINE_GROUP_ID を設定
 
-# 3. Pythonパッケージをインストール
+# 3. Python 仮想環境の作成 & 有効化
 python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+# Windows
+venv\Scripts\activate
+# macOS / Linux
+# source venv/bin/activate
+
+# 4. 依存関係のインストール
 pip install -r requirements.txt
 
-# 4. テスト実行
+# 5. 統合テストを実行（実際に LINE に通知されます）
 python test_local.py
 ```
 
-### Cloud Functionsにデプロイ（10分で完了）
+* LINE に通知が届き、ログにエラーが出ていなければローカルセットアップ完了です。
+* 本番運用は後述の「Google Cloud Functions へのデプロイ」を参照してください。
 
-詳細な手順は [DEPLOYMENT.md](DEPLOYMENT.md) を参照してください。
+---
+
+## セットアップ
+
+### 1. LINE Messaging API の準備
+
+#### ステップ1: LINE Developers コンソールへアクセス
+
+1. ブラウザで [LINE Developers Console](https://developers.line.biz/console/) を開く
+2. 使用する LINE アカウントでログイン
+
+#### ステップ2: プロバイダー・チャネルの作成
+
+1. 「**プロバイダーを作成**」をクリック（初回のみ）
+
+   * プロバイダー名: 任意（例: `Switch2Monitor`）
+2. 作成したプロバイダーを選択
+3. 「**チャネルを作成**」→「**Messaging API**」を選択
+4. チャネル情報を入力
+
+   * チャネル名: `Switch2監視システム` など
+   * チャネル説明 / カテゴリ / サブカテゴリ: 任意
+5. 利用規約に同意して作成
+
+#### ステップ3: チャネルアクセストークンの発行
+
+1. 作成したチャネルを選択
+2. 「**Messaging API 設定**」タブを開く
+3. 「チャネルアクセストークン（長期）」で **「発行」** ボタンをクリック
+4. 表示されたトークンをコピーして安全に保存
+
+> ⚠️ **重要**
+> チャネルアクセストークンは Git にコミットしないでください。`.env` などにのみ保存します。
+
+---
+
+### 2. ユーザー ID / グループ ID の取得
+
+このシステムでは、通知先として **ユーザー単体** もしくは **グループ** を指定します。
+
+#### 個人宛てに通知する場合（LINE_USER_ID）
+
+1. 作成した Bot の QR コード等から、自分の LINE に Bot を友だち追加
+2. Bot に適当なメッセージを送る（「テスト」など）
+3. Webhook（後述）で受け取ったイベントの `event.source.userId` をログに出力するようにし、その値を控える
+
+#### グループ宛てに通知する場合（LINE_GROUP_ID）
+
+1. 通知したいグループに Bot を招待する
+2. グループ内で Bot にメンションするかメッセージを送る
+3. Webhook イベントの `event.source.groupId` をログに出力し、その値を使用する
+
+> ※ 本 README のサンプルコードは **Webhook ハンドラの実装** を前提にしていませんが、
+> ユーザー / グループ ID の取得時に一時的に Webhook を有効にすることを想定しています。
+
+---
+
+### 3. 環境変数の設定
+
+#### ローカル（.env）
+
+`.env.example` をコピーして `.env` を作成し、以下を設定します。
+
+```env
+LINE_CHANNEL_ACCESS_TOKEN=your_channel_access_token_here
+LINE_USER_ID=your_user_id_here
+# グループ宛てに通知する場合は USER_ID の代わりに以下を使用
+# LINE_GROUP_ID=your_group_id_here
+```
+
+* `LINE_USER_ID` と `LINE_GROUP_ID` は **どちらか片方だけ** を設定してください。
+* トークンは **引用符で囲まない**（例: `LINE_CHANNEL_ACCESS_TOKEN="xxx"` は NG）。
+
+#### Google Cloud Functions（環境変数）
+
+Cloud Functions へデプロイする際に、`--set-env-vars` または `--update-env-vars` で同じキーを指定します。
 
 ```bash
-# 1. Google Cloudにログイン
-gcloud auth login
-gcloud config set project YOUR_PROJECT_ID
-
-# 2. デプロイ
 gcloud functions deploy switch2_monitor \
   --gen2 \
   --runtime python311 \
   --trigger-http \
   --allow-unauthenticated \
   --entry-point main \
-  --set-env-vars LINE_CHANNEL_ACCESS_TOKEN=your_channel_access_token,LINE_USER_ID=your_user_id,LINE_GROUP_ID=your_group_id \
-  --region asia-northeast1
-
-# 3. 1時間ごとに自動実行
-gcloud scheduler jobs create http switch2_monitor_job \
-  --schedule="0 * * * *" \
-  --uri="https://YOUR_FUNCTION_URL" \
-  --http-method=GET \
-  --location asia-northeast1
+  --region asia-northeast1 \
+  --set-env-vars \
+    LINE_CHANNEL_ACCESS_TOKEN=your_channel_access_token,\
+    LINE_USER_ID=your_user_id,\
+    LINE_GROUP_ID=your_group_id
 ```
 
-## 機能
+---
 
-- 任天堂公式ストア（https://store-jp.nintendo.com/）を監視
-- キーワードベースの検出（Switch2、多言語、抽選、招待販売など）
-- コンテンツハッシュによる変更検出
-- 前回の状態と比較し、変更があった場合のみ通知
-- エラーハンドリングとリトライ機能
-- 詳細なログ出力
-- Google Cloud Functionsで自動実行可能
+## ローカルでのテスト（詳細）
 
-## セットアップ
-
-### 1. LINE Messaging API の設定
-
-#### ステップ1: LINE Developersコンソールへのアクセス
-
-1. ブラウザで [LINE Developers Console](https://developers.line.biz/console/) にアクセス
-2. LINEアカウントでログイン
-
-#### ステップ2: プロバイダーとチャネルの作成
-
-1. 「プロバイダーを作成」をクリック（初回のみ）
-   - プロバイダー名: 任意（例: `Switch2Monitor`）
-2. 作成したプロバイダーを選択
-3. 「チャネルを作成」をクリック
-4. 「Messaging API」を選択
-5. チャネル情報を入力：
-   - チャネル名: `Switch2監視システム` など
-   - チャネル説明: 任意
-   - カテゴリ: 適当なものを選択
-   - サブカテゴリ: 適当なものを選択
-6. 利用規約に同意して「作成」をクリック
-
-#### ステップ3: チャネルアクセストークンの発行
-
-1. 作成したチャネルを選択
-2. 「Messaging API設定」タブを選択
-3. 「チャネルアクセストークン（長期）」の「発行」ボタンをクリック
-4. 表示されたトークンをコピーして安全に保存
-
-⚠️ **重要**: トークンは厳重に管理してください
-
-#### ステップ4: ユーザーID / グループIDの取得
-
-**個人宛てに通知する場合（USER_ID）:**
-1. LINEアプリで作成したBotを友だち追加
-2. Botにメッセージを送信
-3. Webhook経由、または[LINE Official Account Manager](https://manager.line.biz/)でユーザーIDを確認
-
-**グループ宛てに通知する場合（GROUP_ID）:**
-1. LINEグループにBotを追加
-2. Webhook経由でグループIDを確認
-
-#### ステップ5: 環境変数の設定
-
-ローカル環境の場合:
-```bash
-# .envファイルに設定
-echo "LINE_CHANNEL_ACCESS_TOKEN=your_channel_access_token_here" > .env
-echo "LINE_USER_ID=your_user_id_here" >> .env
-# またはグループの場合
-echo "LINE_GROUP_ID=your_group_id_here" >> .env
-```
-
-Cloud Functionsの場合:
-```bash
-# デプロイ時に環境変数として設定（後述）
-gcloud functions deploy ... --set-env-vars LINE_CHANNEL_ACCESS_TOKEN=your_token,LINE_USER_ID=your_user_id
-```
-
-#### 設定のテスト
+### ステップ1: Python 環境の確認
 
 ```bash
-# Pythonでテスト
-python notifier.py
-```
-
-#### トラブルシューティング
-
-- **チャネルアクセストークンが無効**: トークンを再発行
-- **USER_ID/GROUP_IDが不明**: Webhook URLを設定してログから確認
-- **メッセージが届かない**: チャネルの応答設定を確認
-
-### 2. 環境変数の設定
-
-```bash
-cp .env.example .env
-```
-
-`.env` ファイルを編集し、LINE Messaging API情報を設定：
-
-```
-LINE_CHANNEL_ACCESS_TOKEN=your_channel_access_token_here
-LINE_USER_ID=your_user_id_here
-# またはグループ宛ての場合
-LINE_GROUP_ID=your_group_id_here
-```
-
-### 3. ローカルでのテスト
-
-#### ステップ1: Python環境の準備
-
-Python 3.11以上がインストールされていることを確認：
-```bash
-python --version
-# または
+python --version   # 3.11 以上推奨
+# or
 python3 --version
 ```
 
-#### ステップ2: 仮想環境の作成と有効化
+### ステップ2: 仮想環境の作成・有効化
 
 ```bash
-# 仮想環境の作成
 python -m venv venv
 
-# 仮想環境の有効化
 # Windows (コマンドプロンプト)
 venv\Scripts\activate
 
 # Windows (PowerShell)
 venv\Scripts\Activate.ps1
 
-# macOS/Linux
+# macOS / Linux
 source venv/bin/activate
 ```
 
-仮想環境が有効化されると、プロンプトの先頭に `(venv)` が表示されます。
-
-#### ステップ3: 依存関係のインストール
+### ステップ3: 依存関係のインストール
 
 ```bash
-# requirements.txtから一括インストール
 pip install -r requirements.txt
-
-# インストール確認
-pip list
+pip list  # 必要に応じて確認
 ```
 
-#### ステップ4: 統合テストスイートの実行（推奨）
+### ステップ4: 統合テストスイートの実行（推奨）
 
 ```bash
-# 統合テストスクリプトを実行
 python test_local.py
 ```
 
-このスクリプトは以下をテストします：
-1. ✅ 設定の確認（環境変数、キーワードなど）
-2. ✅ LINE Messaging API通知（実際に通知を送信）
-3. ✅ スクレイピング（任天堂ストアのページを取得）
-4. ✅ 状態管理（変更検出ロジック）
-5. ✅ システム全体（実際の監視実行）
+このスクリプトでは、主に以下をテストします：
 
-#### ステップ5: 個別コンポーネントのテスト（オプション）
+1. 設定の確認（環境変数、キーワードなど）
+2. LINE Messaging API 通知（実際に通知を送信）
+3. 任天堂ストアのスクレイピング
+4. 状態管理（変更検出ロジック）
+5. 監視処理全体
 
-特定のコンポーネントだけをテストしたい場合：
+### ステップ5: 個別コンポーネントのテスト（任意）
 
 ```bash
-# 設定のテスト
+# 設定
 python config.py
 
-# スクレイピングのテスト
+# スクレイピングのみ
 python scraper.py
 
-# 通知のテスト（5種類の通知を送信）
+# 通知のみ（数種類のメッセージを送信）
 python notifier.py
 
-# 状態管理のテスト
+# 状態管理
 python state_manager.py
 
-# 全体のテスト（実際の監視実行）
+# 本番に近い動作
 python main.py
 ```
 
-#### ステップ6: 動作確認のポイント
+### ステップ6: 正常動作チェック
 
-**正常に動作している場合:**
-- ✅ LINEアプリに通知が届く
-- ✅ ログに "スキャン成功" と表示される
-- ✅ `switch2_state.json` ファイルが作成される
-- ✅ 初回実行では「初回実行のため、通知をスキップ」と表示される
-- ✅ 2回目以降は変更がない場合「変更なし」と表示される
+**正常な場合**
 
-**エラーが発生する場合:**
-- ❌ `LINE_CHANNEL_ACCESS_TOKEN` が設定されていない → `.env` ファイルを確認
-- ❌ ネットワークエラー → インターネット接続を確認
-- ❌ スクレイピング失敗 → 任天堂ストアがアクセス可能か確認
+* LINE アプリに通知が届く
+* ログに「スキャン成功」等のメッセージ
+* `switch2_state.json` が作成されている
+* 初回実行では「初回実行のため、通知をスキップ」と表示
+* 2回目以降、変更がない場合は「変更なし」と表示
 
-### 4. テストモードと強制通知モード
+**よくある原因**
 
-Cloud Functionsデプロイ後、以下のクエリパラメータでテスト可能：
+* `.env` にトークンが入っていない
+* ネットワークエラー
+* 任天堂ストアへのアクセス制限 など
 
-- `?test=true` : LINE Messaging APIの疎通確認（テスト通知を送信）
-- `?force=true` : 強制通知モード（状態をリセットして通知）
+---
 
-## Google Cloud Functionsへのデプロイ
+## Cloud Functions 用テストモード
 
-📖 **詳細なデプロイ手順は [DEPLOYMENT.md](DEPLOYMENT.md) を参照してください**
+Cloud Functions にデプロイ後、HTTP クエリパラメータで動作モードを切り替えられます。
+
+* `?test=true`
+
+  * LINE Messaging API 連携の疎通テスト
+  * スクレイピングは行わず、テストメッセージのみ送信
+* `?force=true`
+
+  * 状態をリセットして監視 + 通知を強制実行
+  * 「通知が来ないときに一度リセットしたい」場合に使用
+
+例：
+
+```bash
+curl "https://YOUR_FUNCTION_URL?test=true"
+curl "https://YOUR_FUNCTION_URL?force=true"
+```
+
+---
+
+## Google Cloud Functions へのデプロイ
+
+> さらに細かい説明は `DEPLOYMENT.md` にまとまっています。
+> ここでは README 用に、よく使うコマンドだけを整理しています。
 
 ### 前提条件
 
-- Google Cloudアカウント
-- 課金が有効化されたGCPプロジェクト
-- LINE Messaging APIトークン
+* Google Cloud アカウント
+* 課金が有効な GCP プロジェクト
+* `gcloud`（Google Cloud SDK）がインストール済み
+* LINE Messaging API のチャネルアクセストークン
 
-### 1. Google Cloud SDKのインストール
-
-[Google Cloud SDK](https://cloud.google.com/sdk/docs/install) をインストールします。
+### 1. Google Cloud SDK のインストール確認
 
 ```bash
-# インストール確認
 gcloud --version
 ```
 
-### 2. Google Cloudの初期設定
+インストールされていなければ、公式のドキュメントからセットアップしてください。
+
+### 2. プロジェクト・リージョンの設定と API 有効化
 
 ```bash
-# Google Cloudにログイン
+# 認証
 gcloud auth login
 
-# プロジェクトIDを設定（YOUR_PROJECT_IDは実際のプロジェクトIDに置き換え）
+# プロジェクト設定
 gcloud config set project YOUR_PROJECT_ID
 
-# 使用するリージョンを設定（例：東京リージョン）
+# Functions デフォルトリージョン（例: 東京）
 gcloud config set functions/region asia-northeast1
 
-# 必要なAPIの有効化
+# 必要な API を有効化
 gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable cloudscheduler.googleapis.com
 gcloud services enable cloudbuild.googleapis.com
 ```
 
-### 3. Cloud Functionsへのデプロイ
+### 3. Cloud Functions へのデプロイ
 
 ```bash
-# プロジェクトディレクトリに移動
 cd switch2
 
-# デプロイコマンド実行（LINE_CHANNEL_ACCESS_TOKENは実際のトークンに置き換え）
 gcloud functions deploy switch2_monitor \
   --gen2 \
   --runtime python311 \
@@ -297,32 +317,36 @@ gcloud functions deploy switch2_monitor \
   --entry-point main \
   --memory 256MB \
   --timeout 60s \
-  --set-env-vars LINE_CHANNEL_ACCESS_TOKEN=your_channel_access_token,LINE_USER_ID=your_user_id,LINE_GROUP_ID=your_group_id \
-  --region asia-northeast1
+  --region asia-northeast1 \
+  --set-env-vars \
+    LINE_CHANNEL_ACCESS_TOKEN=your_channel_access_token,\
+    LINE_USER_ID=your_user_id,\
+    LINE_GROUP_ID=your_group_id
 ```
 
-デプロイが完了すると、関数のURLが表示されます：
-```
+デプロイ後、関数の URL が表示されます：
+
+```text
 https://asia-northeast1-YOUR_PROJECT_ID.cloudfunctions.net/switch2_monitor
 ```
 
-### 4. デプロイ確認
+### 4. デプロイ後の動作確認
 
 ```bash
-# テスト通知の送信
+# テスト通知（疎通確認）
 curl "https://asia-northeast1-YOUR_PROJECT_ID.cloudfunctions.net/switch2_monitor?test=true"
 
-# 正常動作確認（実際の監視実行）
+# 実際の監視実行
 curl "https://asia-northeast1-YOUR_PROJECT_ID.cloudfunctions.net/switch2_monitor"
 ```
 
-### 5. Cloud Schedulerで定期実行
+### 5. Cloud Scheduler で定期実行
 
 ```bash
-# App Engineアプリの初期化（Cloud Scheduler使用に必要）
+# App Engine アプリ作成（Cloud Scheduler 利用に必要）
 gcloud app create --region=asia-northeast1
 
-# スケジューラージョブの作成（1時間ごとに実行）
+# 1時間ごとに実行するジョブを作成
 gcloud scheduler jobs create http switch2_monitor_job \
   --location asia-northeast1 \
   --schedule="0 * * * *" \
@@ -331,113 +355,115 @@ gcloud scheduler jobs create http switch2_monitor_job \
   --time-zone="Asia/Tokyo" \
   --description="Switch2 lottery monitor - runs every hour"
 
-# スケジューラーの動作確認
+# 動作確認（手動実行）
 gcloud scheduler jobs run switch2_monitor_job --location asia-northeast1
-
-# スケジューラーの状態確認
-gcloud scheduler jobs describe switch2_monitor_job --location asia-northeast1
 ```
 
-### 6. 環境変数の更新（必要に応じて）
+### 6. 環境変数の更新
 
 ```bash
-# 環境変数の更新
 gcloud functions deploy switch2_monitor \
   --gen2 \
-  --update-env-vars LINE_CHANNEL_ACCESS_TOKEN=new_channel_access_token,LINE_USER_ID=new_user_id \
-  --region asia-northeast1
+  --region asia-northeast1 \
+  --update-env-vars \
+    LINE_CHANNEL_ACCESS_TOKEN=new_channel_access_token,\
+    LINE_USER_ID=new_user_id
 ```
 
 ### 7. ログの確認
 
 ```bash
-# Cloud Functionsのログを表示
+# 直近ログ
 gcloud functions logs read switch2_monitor \
   --region asia-northeast1 \
   --limit 50
 
-# リアルタイムでログを監視
+# リアルタイム監視
 gcloud functions logs read switch2_monitor \
   --region asia-northeast1 \
   --limit 10 \
   --follow
 ```
 
+---
+
 ## トラブルシューティング
 
-### ローカル環境のトラブルシューティング
+### ローカル開発
 
-#### エラー: `ModuleNotFoundError: No module named 'xxx'`
+#### `ModuleNotFoundError: No module named 'xxx'`
 
-**原因**: 依存関係がインストールされていない
+**原因**: 依存ライブラリが未インストール
 
-**解決方法**:
+**対処:**
+
 ```bash
 # 仮想環境が有効化されているか確認
-which python  # macOS/Linux
-where python  # Windows
+which python   # macOS / Linux
+where python   # Windows
 
 # 依存関係を再インストール
 pip install -r requirements.txt
 
-# 特定のモジュールのみインストール
+# 個別に入れる場合
 pip install requests beautifulsoup4 lxml
 ```
 
-#### エラー: `ValueError: LINE_CHANNEL_ACCESS_TOKEN is not set`
+---
 
-**原因**: 環境変数が設定されていない
+#### `ValueError: LINE_CHANNEL_ACCESS_TOKEN is not set`
 
-**解決方法**:
+**原因**: `.env` にトークンが入っていない / 読み込めていない
+
+**対処:**
+
 ```bash
-# .envファイルが存在するか確認
-ls -la .env  # macOS/Linux
+# .env の存在確認
+ls -la .env  # macOS / Linux
 dir .env     # Windows
 
-# .envファイルが存在しない場合は作成
+# 無ければコピー
 cp .env.example .env
-
-# .envファイルを編集してトークンを設定
-# Windowsの場合
-notepad .env
-
-# macOS/Linuxの場合
-nano .env
-# または
-vi .env
 ```
 
-`.env`ファイルの内容:
-```
+`.env` をエディタで開き、以下のように設定します。
+
+```env
 LINE_CHANNEL_ACCESS_TOKEN=your_actual_token_here_without_quotes
 ```
 
-⚠️ **注意**: トークンは引用符（`"`）で囲まない
+> ⚠️ トークンの前後にスペース・引用符を付けないよう注意してください。
 
-#### エラー: `requests.exceptions.ConnectionError`
+---
 
-**原因**: ネットワーク接続の問題
+#### `requests.exceptions.ConnectionError`
 
-**解決方法**:
-1. インターネット接続を確認
-2. プロキシ設定が必要な場合は環境変数を設定:
+**原因**: ネットワーク障害 / プロキシ / ファイアウォール
+
+**対処:**
+
+1. 通常のブラウザで `https://store-jp.nintendo.com` にアクセスできるか確認
+2. 必要ならプロキシ環境変数を設定
+
 ```bash
 export HTTP_PROXY=http://proxy.example.com:8080
 export HTTPS_PROXY=http://proxy.example.com:8080
 ```
-3. ファイアウォールで `https://store-jp.nintendo.com` と `https://api.line.me` へのアクセスが許可されているか確認
 
-#### エラー: LINE通知が届かない
+3. `https://api.line.me` への通信がブロックされていないか確認
 
-**原因1**: トークンが間違っている
+---
 
-**確認方法**:
-```bash
-# Pythonでテスト
-python notifier.py
-```
+#### LINE 通知が届かない
 
-または、curlで直接テスト（USER_IDまたはGROUP_IDが必要）:
+**主な原因**
+
+1. チャネルアクセストークンの誤り
+2. USER_ID / GROUP_ID の誤り
+3. LINE 側の通知設定（ミュート・ブロック）
+
+**追加確認用:** `curl` で直接叩く
+
 ```bash
 curl -X POST https://api.line.me/v2/bot/message/push \
   -H "Authorization: Bearer YOUR_CHANNEL_ACCESS_TOKEN" \
@@ -448,216 +474,68 @@ curl -X POST https://api.line.me/v2/bot/message/push \
   }'
 ```
 
-**原因2**: トークンに余分な文字が含まれている
+---
 
-**解決方法**:
-- トークンの前後にスペースや改行がないか確認
-- `.env`ファイルで引用符を使用していないか確認
+### Google Cloud Functions
 
-**原因3**: LINEアプリで通知がブロックされている
+#### `gcloud: command not found`
 
-**解決方法**:
-1. LINEアプリを開く
-2. 設定 → 通知 → LINE Messaging API
-3. 通知がONになっているか確認
+→ Cloud SDK 未インストール。公式手順に従ってインストール後、ターミナルを再起動してください。
+
+#### `ERROR: (gcloud.functions.deploy) PERMISSION_DENIED`
+
+* `gcloud auth list` でアカウント確認
+* プロジェクトの IAM で、Cloud Functions 管理権限があるか確認
+* 必要に応じて `roles/cloudfunctions.admin` などを付与
+
+#### `ERROR: (gcloud.functions.deploy) RESOURCE_EXHAUSTED: Quota exceeded`
+
+* GCP コンソールの「割り当て」で Cloud Functions のクォータを確認
+* 不要な関数の削除
+* あるいはクォータ増加を申請
+
+#### ビルドエラー（Build failed）
+
+* ローカルで `pip install -r requirements.txt` を試してバージョンを調整
+* `==` を `>=` に緩めるなどして依存ライブラリの制約を調整
+* `gcloud builds` のログで詳細を確認
 
 ---
 
-### Google Cloud Functions のトラブルシューティング
+### 実行時の挙動に関する FAQ
 
-#### エラー: `gcloud: command not found`
+#### Q. 初回実行で通知が来ません
 
-**原因**: Google Cloud SDKがインストールされていない
+**A. 正常です。**
 
-**解決方法**:
-1. [Google Cloud SDK](https://cloud.google.com/sdk/docs/install) をダウンロードしてインストール
-2. インストール後、ターミナルを再起動
-3. 確認: `gcloud --version`
-
-#### エラー: `ERROR: (gcloud.functions.deploy) PERMISSION_DENIED`
-
-**原因**: 権限が不足している
-
-**解決方法**:
-```bash
-# 現在のアカウントを確認
-gcloud auth list
-
-# 必要に応じて再認証
-gcloud auth login
-
-# プロジェクトの所有者/編集者権限があるか確認
-gcloud projects get-iam-policy YOUR_PROJECT_ID
-
-# Cloud Functions管理者ロールを追加（プロジェクトオーナーが実行）
-gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
-  --member="user:YOUR_EMAIL" \
-  --role="roles/cloudfunctions.admin"
-```
-
-#### エラー: `ERROR: (gcloud.functions.deploy) RESOURCE_EXHAUSTED: Quota exceeded`
-
-**原因**: Cloud Functionsのクォータ（割り当て）を超過している
-
-**解決方法**:
-1. [GCP Console](https://console.cloud.google.com/) にアクセス
-2. IAMと管理 → 割り当て
-3. Cloud Functionsの割り当てを確認し、必要に応じて増加リクエスト
-4. または既存の不要な関数を削除:
-```bash
-gcloud functions list
-gcloud functions delete FUNCTION_NAME
-```
-
-#### エラー: `ERROR: (gcloud.functions.deploy) Build failed`
-
-**原因**: requirements.txtの依存関係の問題
-
-**解決方法**:
-```bash
-# ローカルで依存関係をテスト
-pip install -r requirements.txt
-
-# バージョン指定を緩和（requirements.txtで==を>=に変更）
-# 例: requests==2.31.0 → requests>=2.31.0
-
-# Cloud Buildのログを確認
-gcloud builds list --limit=5
-gcloud builds log BUILD_ID
-```
-
-#### エラー: デプロイは成功するが関数が動作しない
-
-**原因1**: 環境変数が設定されていない
-
-**確認方法**:
-```bash
-# 環境変数を確認
-gcloud functions describe switch2_monitor \
-  --region asia-northeast1 \
-  --format="value(environmentVariables)"
-```
-
-**解決方法**:
-```bash
-# 環境変数を更新
-gcloud functions deploy switch2_monitor \
-  --gen2 \
-  --update-env-vars LINE_CHANNEL_ACCESS_TOKEN=your_token \
-  --region asia-northeast1
-```
-
-**原因2**: エントリーポイントが間違っている
-
-**確認方法**:
-```bash
-# main.pyに@functions_framework.httpデコレータが付いたmain関数があるか確認
-grep -A 5 "@functions_framework.http" main.py
-```
-
-**解決方法**: エントリーポイントを明示的に指定
-```bash
-gcloud functions deploy switch2_monitor \
-  --entry-point main \
-  ...
-```
-
-#### エラー: Cloud Schedulerが実行されない
-
-**原因1**: App Engineアプリが初期化されていない
-
-**確認方法**:
-```bash
-gcloud app describe
-```
-
-エラーが出る場合:
-```bash
-gcloud app create --region=asia-northeast1
-```
-
-**原因2**: スケジューラージョブが無効になっている
-
-**確認方法**:
-```bash
-gcloud scheduler jobs list --location asia-northeast1
-```
-
-**解決方法**:
-```bash
-# ジョブを有効化
-gcloud scheduler jobs resume switch2_monitor_job --location asia-northeast1
-
-# ジョブを手動実行してテスト
-gcloud scheduler jobs run switch2_monitor_job --location asia-northeast1
-```
-
-**原因3**: タイムゾーンの設定ミス
-
-**解決方法**:
-```bash
-# タイムゾーンを確認・更新
-gcloud scheduler jobs update http switch2_monitor_job \
-  --location asia-northeast1 \
-  --time-zone="Asia/Tokyo"
-```
+初回実行は「ベースライン」作成のため、通知を送らずに状態だけ保存します。
+2回目以降、変更があれば通知されます。
 
 ---
 
-### 実行時のトラブルシューティング
+#### Q. 変更があるはずなのに通知が来ません
 
-#### 問題: 初回実行で通知が来ない
+* `switch2_state.json` が壊れている / 古い可能性 → `?force=true` で一度状態リセット
+* キーワードマッチ条件が厳しすぎる可能性 → `config.py` の `WATCH_KEYWORDS` を確認
 
-**これは正常な動作です！**
-
-理由: システムは初回実行時にベースラインを確立するため、通知を送信しません。
-
-確認方法:
-```bash
-# ログで「初回実行のため、通知をスキップ」というメッセージを確認
-gcloud functions logs read switch2_monitor --region asia-northeast1
-```
-
-2回目以降の実行で変更があれば通知が送信されます。
-
-#### 問題: 変更があるのに通知が来ない
-
-**原因1**: 状態ファイルが更新されていない
-
-**解決方法**: 強制通知モードで実行
 ```bash
 curl "https://YOUR_FUNCTION_URL?force=true"
 ```
 
-**原因2**: キーワードにマッチしていない
+---
 
-**解決方法**:
-1. ログでスキャン結果を確認:
+#### Q. 通知が多すぎます
+
+* ページの動的な変化（日時・ランキングなど）で頻繁にハッシュが変わっている可能性
+* `KEYWORD_MATCH_MODE=all` にする、キーワードを絞るなどで改善可能
+
+---
+
+#### Q. 実行時間のタイムアウトが発生します
+
+Cloud Functions の `timeout` を延長します（例: 120 秒）。
+
 ```bash
-gcloud functions logs read switch2_monitor --region asia-northeast1 | grep "検出"
-```
-
-2. 必要に応じてキーワードを追加（config.py の WATCH_KEYWORDS）
-
-#### 問題: 通知が多すぎる
-
-**原因**: ページの動的コンテンツがキーワードにマッチしている
-
-**解決方法**:
-1. キーワードマッチモードを `all` に変更（.env）:
-```
-KEYWORD_MATCH_MODE=all
-```
-
-2. より具体的なキーワードに変更（config.py）
-
-#### 問題: タイムアウトエラー
-
-**原因**: 処理時間が制限（60秒）を超過
-
-**解決方法**:
-```bash
-# タイムアウトを延長（最大540秒）
 gcloud functions deploy switch2_monitor \
   --gen2 \
   --timeout 120s \
@@ -666,147 +544,40 @@ gcloud functions deploy switch2_monitor \
 
 ---
 
-### よくある質問（FAQ）
+## 実装の概要
 
-**Q: 状態ファイルはどこに保存されますか？**
+### スクレイピング（`scraper.py`）
 
-A:
-- ローカル: プロジェクトディレクトリの `switch2_state.json`
-- Cloud Functions: 関数の一時ストレージ（永続化されない）
+* 任天堂ストアの HTML から、キーワードにマッチするテキスト・リンク・見出しなどを抽出
+* 最大 3 回までリトライする堅牢な取得処理
+* 抽出結果からハッシュ値を算出し、前回との差分判定に使用
 
-Cloud Functionsで永続化したい場合は、Cloud Storageを使用してください（config.pyで設定可能）。
+### 状態管理（`state_manager.py`）
 
-**Q: 監視頻度はどのくらいが適切ですか？**
+* ローカルでは `switch2_state.json` に状態を保存
+* Cloud Functions 利用時は、必要に応じて Cloud Storage に永続化する設計
+* 初回実行時は通知せず、2回目以降に差分があれば通知
 
-A:
-- 推奨: 1時間ごと（`0 * * * *`）
-- 最小: 15分ごと（ただしAPI制限に注意）
-- 注意: あまり頻繁だとサイトに負荷をかける可能性があります
+### 通知（`notifier.py`）
 
-**Q: 複数のキーワードを監視できますか？**
+* 新情報通知（Switch2 抽選情報など）
+* テスト通知
+* エラー通知
+* ステータス通知（`success`, `info`, `warning`, `error`）
 
-A: はい、`config.py`の`WATCH_KEYWORDS`リストに追加してください。
+通知メッセージは、見出し / バナー / リンクなどをグルーピングし、
+絵文字や区切り線で視認性を高めています。
+LINE の 5000 文字制限を超えないように自動で切り詰めも行います。
 
-**Q: 費用はどのくらいかかりますか？**
-
-A:
-- Cloud Functions: 月間200万リクエストまで無料
-- 1時間ごと実行: 約720回/月（無料枠内）
-- Cloud Scheduler: 月3ジョブまで無料
-- 合計: **ほぼ無料**（無料枠内で運用可能）
-
-**Q: テストモードと強制通知モードの違いは？**
-
-A:
-- テストモード（`?test=true`）: LINE Messaging API連携のテスト通知のみ送信（スクレイピングなし）
-- 強制通知モード（`?force=true`）: 状態をリセットして実際にスクレイピング＆通知を送信
-
-## ファイル構成
-
-```
-switch2/
-├── main.py              # Cloud Functions エントリーポイント
-├── scraper.py           # スクレイピングロジック（任天堂ストア最適化）
-├── notifier.py          # LINE Messaging API通知ロジック
-├── state_manager.py     # 状態管理（変更検出）
-├── config.py            # 設定ファイル
-├── test_local.py        # ローカルテストスイート
-├── requirements.txt     # Python依存関係
-├── .env.example         # 環境変数サンプル
-├── .gitignore           # Git除外設定
-├── .gcloudignore        # Cloud Functions デプロイ除外設定
-├── README.md            # このファイル（プロジェクト概要）
-├── DEPLOYMENT.md        # デプロイ手順書
-└── CLAUDE.md            # 開発者向けガイド（Claude Code用）
-```
-
-## 実装の詳細
-
-### スクレイピング (scraper.py)
-
-任天堂公式ストアのHTML構造に最適化：
-
-- **キーワード検出**: 設定されたキーワード（Switch2、多言語、抽選など）を含むコンテンツを検出
-- **複数の要素タイプに対応**:
-  - 見出し（h1-h6）
-  - リンク（a要素）
-  - バナー・通知エリア
-  - 段落・div要素
-- **リトライ機能**: 最大3回までリトライ
-- **ハッシュ値計算**: コンテンツの変更検出用
-
-### 状態管理 (state_manager.py)
-
-前回の状態と比較して変更を検出：
-
-- **JSONファイルで状態を保存**: ローカルまたはCloud Storage
-- **ハッシュ値による変更検出**: コンテンツが変更されたかを正確に判定
-- **新規アイテムの抽出**: 前回から追加されたアイテムのみを通知
-- **初回実行の特別処理**: 初回は通知をスキップ
-
-### 通知 (notifier.py)
-
-LINE Messaging APIで通知を送信：
-
-#### 主要機能
-
-1. **新情報検出通知** (`send_lottery_notification_v2`)
-   - タイプ別グループ化（見出し、バナー、リンク、段落）
-   - 絵文字による視覚的な区別
-   - タイトル、概要、URLを整形表示
-   - 検出時刻と総数を表示
-   - 各タイプ最大3件まで表示（見やすさ重視）
-
-2. **テスト通知** (`send_test_notification`)
-   - システム動作確認用
-   - LINE Messaging API連携の疎通確認
-
-3. **エラー通知** (`send_error_notification`)
-   - エラー内容の整形表示
-   - 発生時刻の記録
-   - 確認項目のリスト表示
-
-4. **ステータス通知** (`send_status_notification`)
-   - success, info, warning, error の4種類
-   - ステータスに応じた絵文字表示
-
-#### 通知フォーマットの特徴
-
-```
-━━━━━━━━━━━━━━━━━━
-🎮 Switch2 新情報検出！
-━━━━━━━━━━━━━━━━━━
-
-📌 重要見出し
-────────────────────
-
-💡 「Nintendo Switch 2（多言語対応）」招待販売について
-   申込期限: 11月18日（火）午前11:00
-   🔗 ...nintendo.com/switch2
-
-📢 バナー情報
-────────────────────
-
-🔔 Switch2 抽選販売 受付中
-   詳細はこちら
-   🔗 ...nintendo.com/lottery/switch2
-
-━━━━━━━━━━━━━━━━━━
-検出時刻: 2025-11-14 10:00
-検出総数: 5件
-━━━━━━━━━━━━━━━━━━
-```
-
-#### 文字数制限
-
-- LINE Messaging APIは5000文字まで
-- 超過する場合は自動的に切り詰め
+---
 
 ## 注意事項
 
-- スクレイピングは対象サイトの利用規約を確認してください
-- リクエスト頻度は適切に設定してください（サーバーに負荷をかけないよう）
-- LINE Messaging APIトークンは厳重に管理してください
+* 対象サイトの利用規約に従い、過度な高頻度アクセスは避けてください
+* トークン類（LINE_CHANNEL_ACCESS_TOKEN など）は必ず秘匿し、Git にコミットしないでください
+* 本リポジトリは学習・個人利用を想定しています。商用利用時は自己責任でお願いします
+
+---
 
 ## ライセンス
 
